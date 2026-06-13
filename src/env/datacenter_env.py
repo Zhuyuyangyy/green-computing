@@ -8,6 +8,12 @@ Data Center Energy Optimization Environment
 - 热阻网络: Eq.(eq:thermal_network)
 - PUE: Eq.(eq:pue)
 - 碳排放: Eq.(eq:carbon_emission)
+
+DISCLAIMER: This is a SIMPLIFIED SIMULATION environment.  All physics
+models use idealised parameters (constant thermal resistance, linear COP,
+fixed workload distributions).  No real data center hardware is controlled.
+Results produced by this environment are SYNTHETIC and should not be cited
+as measured energy savings.
 """
 
 import numpy as np
@@ -224,11 +230,22 @@ class DataCenterEnv:
 
     # ── Minute-level 动作: 负载迁移 ─────────────────────────────────
     def step_minute(
-        self, migrate_action: np.ndarray
+        self,
+        migrate_action: np.ndarray,
+        second_level_actions: Optional[list] = None,
     ) -> Tuple[np.ndarray, float, bool, Dict]:
         """
         Minute-level: 60s 负载均衡
         migrate_action: n_gpus, 迁移比例 [0,1]
+        second_level_actions: list of (freq_action, flow_action) tuples for
+            each sub-second step within this minute. If None, the caller is
+            responsible for driving second-level steps externally.  When
+            provided, its length determines how many sub-steps are executed
+            (typically 60 for one-minute windows).
+
+        NOTE: Previously this method generated random second-level actions
+        internally, which broke the hierarchical structure.  The caller must
+        now supply the agent's second-level actions explicitly.
         """
         # 简单负载迁移模型
         total_workload = np.sum(self.workload)
@@ -236,14 +253,11 @@ class DataCenterEnv:
         self.workload = np.clip(self.workload + delta, 0.1, 1.0)
         self.workload = self.workload / np.sum(self.workload) * total_workload
 
-        # 快速推进60步second-level (简化)
-        for _ in range(60):
-            _, _, done_s, _ = self.step_second(
-                np.random.uniform(size=self.n_gpus),
-                np.random.uniform(size=self.n_gpus),
-            )
-            if done_s:
-                break
+        if second_level_actions is not None:
+            for freq_action, flow_action in second_level_actions:
+                _, _, done_s, _ = self.step_second(freq_action, flow_action)
+                if done_s:
+                    break
 
         p_gpu = self.compute_gpu_power(self.gpu_util, self.gpu_freq)
         p_chiller = self.compute_chiller_power(
@@ -261,7 +275,15 @@ class DataCenterEnv:
 
         done = self.episode_step >= 60  # minute-level episode
 
-        return self.get_observation(), r, done, {}
+        info = {
+            "p_gpu_total": float(np.sum(p_gpu)),
+            "p_chiller": float(p_chiller),
+            "p_total": float(p_total),
+            "pue": float(self.compute_pue(np.sum(p_gpu), p_chiller)),
+            "thermal_violation": bool(np.any(self.t_junction > self.t_j_max)),
+        }
+
+        return self.get_observation(), r, done, info
 
     # ── 环境扰动: 模拟真实碳强度波动 ───────────────────────────────
     def apply_environmental_disturbance(self):

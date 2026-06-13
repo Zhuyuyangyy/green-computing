@@ -112,7 +112,10 @@ class MinuteLevelTD3:
             # TD3: min of two target Q values
             q1_target, q2_target = self.critic_target(next_latent, next_action)
             q_target = torch.min(q1_target, q2_target)
-            q_backup = reward + self.gamma * (1 - done.float()) * q_target
+            # Ensure proper [B, 1] shape for broadcasting with q_target
+            reward_t = reward.unsqueeze(1) if reward.dim() == 1 else reward
+            done_t = done.unsqueeze(1) if done.dim() == 1 else done
+            q_backup = reward_t + self.gamma * (1 - done_t.float()) * q_target
 
         # Critic update
         q1, q2 = self.critic(latent, action)

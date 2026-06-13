@@ -13,6 +13,7 @@ Green Computing - 数据中心能效优化系统
 import sys
 import os
 import argparse
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
@@ -46,10 +47,17 @@ def demo_mode():
     print("  • PUE: Eq.(eq:pue) - 目标 < 1.2")
     print("  • 碳排放: Eq.(eq:carbon_emission)")
     print()
-    print("优化效果:")
-    print("  • PUE: 1.45 → 1.18 (节能19%)")
-    print("  • 碳排放: -23% (配合绿电调度)")
-    print("  • GPU利用率: +15% (负载均衡)")
+    print("=" * 58)
+    print("  DISCLAIMER: ALL RESULTS ARE SYNTHETIC")
+    print("  The figures below are design targets from a simplified")
+    print("  simulation, NOT measured outcomes from a trained policy")
+    print("  or real-world deployment.")
+    print("=" * 58)
+    print()
+    print("设计目标 (仿真估算, 非实测):")
+    print("  • PUE: 1.45 → 1.18 (节能19%) — 设计目标")
+    print("  • 碳排放: -23% (配合绿电调度) — 设计目标")
+    print("  • GPU利用率: +15% (负载均衡) — 设计目标")
     print()
     print("=" * 58)
     print("  使用 --train 运行完整训练")
@@ -57,8 +65,15 @@ def demo_mode():
 
 
 def train_mode(epochs):
-    """训练模式"""
+    """训练模式
+
+    DISCLAIMER: Training runs against a simplified simulation environment.
+    All reported metrics (PUE, carbon, power) are synthetic — they come
+    from the simulated data center, not from real hardware.  The trained
+    policy has NOT been validated on actual data center infrastructure.
+    """
     print(f"[模式] 训练模式 (epochs={epochs})")
+    print("[注意] 所有训练指标来自简化仿真环境, 非真实硬件测量值。")
     print()
 
     try:
@@ -97,8 +112,24 @@ def train_mode(epochs):
 
 
 def evaluate_mode():
-    """评估模式"""
+    """评估模式
+
+    DISCLAIMER: All results below are SYNTHETIC.  The "optimized" PUE is
+    computed via a hardcoded multiplier (baseline * 0.81), NOT by a trained
+    policy.  This mode only demonstrates the simulation environment; it does
+    NOT prove that the RL agent has learned an effective control strategy.
+    Real-world energy savings require deployment on actual hardware with
+    validated controllers.
+    """
     print("[模式] 评估模式 (evaluate)")
+    print()
+    print("=" * 58)
+    print("  DISCLAIMER: ALL RESULTS ARE SYNTHETIC")
+    print("  The environment is a simplified simulation.")
+    print("  The 'optimized' PUE below uses a hardcoded 19% reduction")
+    print("  multiplier (baseline * 0.81), NOT a trained RL policy.")
+    print("  No real energy savings have been demonstrated.")
+    print("=" * 58)
     print()
 
     try:
@@ -111,8 +142,9 @@ def evaluate_mode():
         state = env.reset()
         total_reward = 0
         for step in range(100):
-            action = env.action_space.sample() if hasattr(env, 'action_space') else [0.5] * 6
-            state, reward, done, info = env.step(action)
+            freq_action = np.full(env.n_gpus, 0.5)
+            flow_action = np.full(env.n_gpus, 0.5)
+            state, reward, done, info = env.step_second(freq_action, flow_action)
             total_reward += reward
             if done:
                 break
@@ -120,14 +152,17 @@ def evaluate_mode():
         baseline_pue = info.get('pue', 1.45)
         print(f"[评估] Baseline PUE: {baseline_pue:.3f} (目标 < 1.2)")
 
-        # 估算优化效果
-        optimized_pue = baseline_pue * 0.81  # ~19%节能
-        print(f"[评估] 优化后 PUE: {optimized_pue:.3f} (↓{(1-optimized_pue/baseline_pue)*100:.1f}%)")
+        # HARDCODED multiplier — NOT a trained policy
+        optimized_pue = baseline_pue * 0.81
+        print(f"[评估] 优化后 PUE (硬编码估算): {optimized_pue:.3f}")
         print()
-        print("[评估] 关键指标:")
-        print(f"  • GPU功率优化: {(1-optimized_pue/baseline_pue)*100:.1f}% 节能")
-        print(f"  • 冷却系统: 热阻网络约束自动满足")
-        print(f"  • 碳排放: 基于碳强度实时调度")
+        print("[评估] 关键指标 (均为仿真估算值):")
+        print(f"  • GPU功率优化: {(1-optimized_pue/baseline_pue)*100:.1f}% 节能 (估算)")
+        print(f"  • 冷却系统: 热阻网络约束 (仿真环境)")
+        print(f"  • 碳排放: 基于碳强度实时调度 (仿真环境)")
+        print()
+        print("[评估] 注意: 上述数值来自简化仿真, 不代表实际部署效果。")
+        print("        需要在真实硬件上验证后才能确认有效性。")
 
     except ImportError as e:
         print(f"[错误] 缺少依赖: {e}")

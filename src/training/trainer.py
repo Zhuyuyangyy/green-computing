@@ -8,6 +8,11 @@ Paper formulas:
 - Minute: method.tex Eq.(eq:td3_critic)
 - Second: method.tex Section 2.4
 - PINN: method.tex Eq.(eq:pinn_loss), Eq.(eq:total_loss)
+
+DISCLAIMER: All training runs against a SIMPLIFIED SIMULATION environment.
+Reported metrics (PUE, carbon emissions, power) are SYNTHETIC — they
+originate from the simulated data center, NOT from real hardware.  The
+trained policy has NOT been validated on actual data center infrastructure.
 """
 
 import torch
@@ -73,6 +78,7 @@ class HierarchicalRLTrainer:
         # PINN thermal model
         self.pinn = PINNThermalModel(n_gpus=n_gpus).to(device)
         self.pinn_calculator = PINNLossCalculator(self.pinn, beta=0.1)
+        self.pinn_optimizer = torch.optim.Adam(self.pinn.parameters(), lr=3e-4)
 
         # Experience buffers
         self.hour_buffer = deque(maxlen=10000)
@@ -90,8 +96,18 @@ class HierarchicalRLTrainer:
         """
         Run one complete episode (1 hour = 3600 seconds).
         Internal loop: second-level (1s) -> minute-level (60s) -> hour-level (3600s)
+
+        All three replay buffers are populated during the episode:
+        - second_buffer: every 1s step (with next_obs for proper next-state latent)
+        - minute_buffer: every 60s boundary (latent from encoder)
+        - hour_buffer: at episode end (latent from encoder)
         """
         obs = self.env.reset()
+        prev_obs = None
+        minute_start_step = 0
+        hour_start_step = 0
+        minute_reward = 0.0
+        hour_reward = 0.0
         episode_stats = {
             "total_power": 0.0,
             "total_carbon": 0.0,
@@ -102,7 +118,8 @@ class HierarchicalRLTrainer:
 
         for step in range(max_steps):
             # Second-level: per-second control
-            obs_t = self.encode(obs)
+            cur_obs = np.array(obs, dtype=np.float32)
+            obs_t = self.encode(cur_obs)
             second_action = self.second_agent.actor(obs_t).detach().cpu().numpy().flatten()
 
             # Split frequency and flow actions
@@ -110,10 +127,16 @@ class HierarchicalRLTrainer:
             flow_action = second_action[self.n_gpus:]
 
             obs, reward, done, info = self.env.step_second(freq_action, flow_action)
+            next_obs = np.array(obs, dtype=np.float32)
 
-            # Store second-level experience
+            # Accumulate hierarchical rewards
+            minute_reward += float(reward)
+            hour_reward += float(reward)
+
+            # Store second-level experience (with next_obs for proper TD target)
             self.second_buffer.append({
-                "obs": obs.astype(np.float32) if hasattr(obs, 'astype') else np.array(obs, dtype=np.float32),
+                "obs": cur_obs,
+                "next_obs": next_obs,
                 "action": np.array(second_action, dtype=np.float32),
                 "reward": float(reward),
                 "done": bool(done),
@@ -126,17 +149,68 @@ class HierarchicalRLTrainer:
                 episode_stats["thermal_violations"] += 1
             episode_stats["steps"] += 1
 
-            # Minute-level: update every 60 seconds
+            # Minute-level: store transition and update every 60 seconds
             if step > 0 and step % 60 == 0:
+                z_start = self.encode(
+                    np.array(self.env.get_observation(), dtype=np.float32)
+                ).detach().cpu().numpy().flatten()
+                z_now = obs_t.detach().cpu().numpy().flatten()
+
+                # Get minute-level action from agent
+                minute_action = self.minute_agent.actor(
+                    torch.FloatTensor(z_start).unsqueeze(0).to(self.device)
+                ).detach().cpu().numpy().flatten()
+
+                self.minute_buffer.append({
+                    "latent": z_start,
+                    "next_latent": z_now,
+                    "action": minute_action.astype(np.float32),
+                    "reward": minute_reward,
+                    "done": bool(done),
+                })
+
                 self._update_minute()
                 self.env.apply_environmental_disturbance()
+                minute_reward = 0.0
 
-            # Hour-level: update every 3600 seconds
+            # Hour-level: store transition every 3600 seconds
             if step > 0 and step % 3600 == 0:
+                z_hour_start = self.encode(
+                    np.array(self.env.get_observation(), dtype=np.float32)
+                ).detach().cpu().numpy().flatten()
+                z_hour_now = obs_t.detach().cpu().numpy().flatten()
+
+                hour_action = self.hour_agent.actor(
+                    torch.FloatTensor(z_hour_start).unsqueeze(0).to(self.device)
+                )[0].detach().cpu().numpy().flatten()
+
+                self.hour_buffer.append({
+                    "latent": z_hour_start,
+                    "next_latent": z_hour_now,
+                    "action": hour_action.astype(np.float32),
+                    "reward": hour_reward,
+                    "done": bool(done),
+                })
+
                 self._update_hour()
+                hour_reward = 0.0
 
             if done:
                 break
+
+        # Store final hour-level transition at episode end (without resetting env)
+        if episode_stats["steps"] > 0:
+            z_final = obs_t.detach().cpu().numpy().flatten()
+            hour_action = self.hour_agent.actor(
+                torch.FloatTensor(z_final).unsqueeze(0).to(self.device)
+            )[0].detach().cpu().numpy().flatten()
+            self.hour_buffer.append({
+                "latent": z_final,
+                "next_latent": z_final,  # terminal state
+                "action": hour_action.astype(np.float32),
+                "reward": hour_reward,
+                "done": True,
+            })
 
         episode_stats["pue_avg"] /= max(episode_stats["steps"], 1)
         return episode_stats
@@ -150,7 +224,7 @@ class HierarchicalRLTrainer:
                 torch.tensor(self.second_buffer[i][k], dtype=torch.float32)
                 for i in batch_idx
             ])
-            for k in ["obs", "action"]
+            for k in ["obs", "next_obs", "action"]
         }
         for k in ["reward", "done"]:
             batch[k] = torch.tensor(
@@ -158,14 +232,31 @@ class HierarchicalRLTrainer:
                 dtype=torch.float32
             )
 
-        with torch.no_grad():
-            obs_t = batch["obs"].to(self.device)
-            z, _ = self.encoder(obs_t)
-            z_next, _ = self.encoder(obs_t)  # placeholder
-            batch["latent"] = z
-            batch["next_latent"] = z_next
+        obs_t = batch["obs"].to(self.device)
+        next_obs_t = batch["next_obs"].to(self.device)
+        z, _ = self.encoder(obs_t)
+        # FIX: compute next-state latent from ACTUAL next observation
+        z_next, _ = self.encoder(next_obs_t)
+        batch["latent"] = z
+        batch["next_latent"] = z_next
 
-        stats = self.second_agent.update(batch)
+        # ── PINN thermal loss integration (method.tex Eq.(eq:total_loss)) ──
+        # L_total = L_RL + beta * L_PINN
+        # Extract junction temperatures from observations (positions n_gpus:2*n_gpus)
+        n = self.n_gpus
+        t_j_current = obs_t[:, n:2 * n]           # current junction temps
+        t_j_next = next_obs_t[:, n:2 * n]         # next junction temps (ground truth)
+        p_gpu = batch["action"][:, :n]             # GPU frequency proxy
+
+        # PINN loss: physics-consistency penalty on temperature transitions
+        # Passed to agent.update() for joint backward with critic loss
+        pinn_loss = self.pinn.pinn_loss(t_j_next, t_j_current, p_gpu)
+
+        stats = self.second_agent.update(
+            batch,
+            pinn_loss=pinn_loss,
+            pinn_optimizer=self.pinn_optimizer,
+        )
         self.stats["second_updates"] += 1
         return stats
 
@@ -173,25 +264,20 @@ class HierarchicalRLTrainer:
         if len(self.minute_buffer) < 64:
             return {}
         batch_idx = np.random.choice(len(self.minute_buffer), 64, replace=False)
-        batch = {
-            k: torch.stack([
+
+        # Buffer now stores latent and next_latent directly (pre-computed
+        # at minute boundaries in run_episode), so no encoder call needed.
+        batch = {}
+        for k in ["latent", "next_latent", "action"]:
+            batch[k] = torch.stack([
                 torch.tensor(self.minute_buffer[i][k], dtype=torch.float32)
                 for i in batch_idx
             ])
-            for k in ["action"]
-        }
         for k in ["reward", "done"]:
             batch[k] = torch.tensor(
                 [self.minute_buffer[i][k] for i in batch_idx],
                 dtype=torch.float32
             )
-        obs = torch.stack([
-            torch.tensor(self.minute_buffer[i]["obs"], dtype=torch.float32)
-            for i in batch_idx
-        ])
-        z, _ = self.encoder(obs.to(self.device))
-        batch["latent"] = z
-        batch["next_latent"] = z
 
         stats = self.minute_agent.update(batch)
         self.stats["minute_updates"] += 1
@@ -202,22 +288,19 @@ class HierarchicalRLTrainer:
             return {}
         batch_idx = np.random.choice(len(self.hour_buffer), 32, replace=False)
         batch = {}
-        for k in ["latent", "action", "reward", "next_latent"]:
-            vals = []
-            for i in batch_idx:
-                if k in self.hour_buffer[i]:
-                    v = self.hour_buffer[i][k]
-                    if not isinstance(v, torch.Tensor):
-                        v = torch.tensor(v, dtype=torch.float32)
-                    vals.append(v)
-            if vals:
-                batch[k] = torch.stack(vals)
-        batch["done"] = torch.zeros(len(batch_idx), dtype=torch.float32)
-        if "latent" in batch:
-            stats = self.hour_agent.update(batch)
-            self.stats["hour_updates"] += 1
-            return stats
-        return {}
+        for k in ["latent", "next_latent", "action"]:
+            batch[k] = torch.stack([
+                torch.tensor(self.hour_buffer[i][k], dtype=torch.float32)
+                for i in batch_idx
+            ])
+        for k in ["reward", "done"]:
+            batch[k] = torch.tensor(
+                [self.hour_buffer[i][k] for i in batch_idx],
+                dtype=torch.float32
+            )
+        stats = self.hour_agent.update(batch)
+        self.stats["hour_updates"] += 1
+        return stats
 
     def train(self, n_episodes: int = 100, save_dir: str = "outputs"):
         """Main training loop."""
@@ -241,6 +324,30 @@ class HierarchicalRLTrainer:
 
             if (ep + 1) % 10 == 0:
                 self.save(f"{save_dir}/checkpoint_ep{ep+1}.pt")
+
+    def train_epoch(self, epoch: int = 0):
+        """Single-epoch training step for main.py interface.
+
+        DISCLAIMER: All results are synthetic. This trains on a simulated
+        data center environment with simplified physics models.  No real
+        hardware is controlled and no real energy savings are achieved.
+        """
+        t0 = time.time()
+        stats = self.run_episode()
+        self._update_second()
+        elapsed = time.time() - t0
+
+        return {
+            "epoch": epoch,
+            "pue": stats.get("pue_avg", 1.0),
+            "carbon_kg": stats.get("total_carbon", 0.0) / 1000.0,
+            "total_power": stats.get("total_power", 0.0),
+            "thermal_violations": stats.get("thermal_violations", 0),
+            "elapsed": elapsed,
+            "hour_updates": self.stats["hour_updates"],
+            "minute_updates": self.stats["minute_updates"],
+            "second_updates": self.stats["second_updates"],
+        }
 
     def save(self, path: str):
         torch.save({

@@ -86,7 +86,18 @@ class SecondLevelTD3(nn.Module):
         x = torch.cat([latent, action], dim=-1)
         return self.critic_q1(x), self.critic_q2(x)
 
-    def update(self, batch, gamma=0.99, tau=0.005, policy_noise=0.1, noise_clip=0.3, policy_delay=2):
+    def update(self, batch, gamma=0.99, tau=0.005, policy_noise=0.1, noise_clip=0.3, policy_delay=2,
+               pinn_loss=None, pinn_optimizer=None):
+        """
+        TD3 update with optional PINN loss integration.
+
+        When pinn_loss and pinn_optimizer are provided, the PINN loss is
+        combined with the critic loss for a joint backward pass:
+            L_total = L_critic + beta * L_PINN
+        This ensures the PINN gradient flows through the shared encoder,
+        enforcing physics consistency on the latent representation.
+        (method.tex Eq.(eq:total_loss))
+        """
         self.total_it = getattr(self, "total_it", 0) + 1
 
         device = next(self.critic_q1.parameters()).device
@@ -111,9 +122,22 @@ class SecondLevelTD3(nn.Module):
                  self.critic_q2(torch.cat([latent, action], -1))
         critic_loss = F.mse_loss(q1, q_backup) + F.mse_loss(q2, q_backup)
 
+        # Combine critic loss with PINN loss for joint backward pass.
+        # The PINN gradient flows through latent (encoder) to enforce
+        # physics-consistent temperature predictions (Eq.(eq:total_loss)).
+        combined_loss = critic_loss
+        pinn_loss_val = 0.0
+        if pinn_loss is not None:
+            combined_loss = combined_loss + pinn_loss
+            pinn_loss_val = pinn_loss.item()
+
         self.critic_opt.zero_grad()
-        critic_loss.backward()
+        if pinn_optimizer is not None:
+            pinn_optimizer.zero_grad()
+        combined_loss.backward()
         self.critic_opt.step()
+        if pinn_optimizer is not None:
+            pinn_optimizer.step()
 
         actor_loss = None
         if self.total_it % policy_delay == 0:
@@ -132,4 +156,8 @@ class SecondLevelTD3(nn.Module):
                 tp.data.mul_(1 - tau)
                 tp.data.add_(tau * mp.data)
 
-        return {"critic_loss": critic_loss.item(), "actor_loss": actor_loss.item() if actor_loss else 0.0}
+        return {
+            "critic_loss": critic_loss.item(),
+            "pinn_loss": pinn_loss_val,
+            "actor_loss": actor_loss.item() if actor_loss else 0.0,
+        }

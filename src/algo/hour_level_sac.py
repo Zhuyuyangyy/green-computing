@@ -106,6 +106,7 @@ class HourLevelSAC:
         self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
         self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
         self.target_entropy = -action_dim
+        self.alpha = self.log_alpha.exp().item()
 
     def update(self, batch: dict) -> dict:
         latent = batch["latent"].to(self.device)
@@ -120,7 +121,10 @@ class HourLevelSAC:
             q1_target, q2_target = self.critic_target(next_latent, next_action)
             q_target = torch.min(q1_target, q2_target)
             v_target = q_target - self.alpha * next_log_prob
-            q_backup = reward + self.gamma * (1 - done.float()) * v_target
+            # Ensure proper [B, 1] shape for broadcasting with v_target
+            reward_t = reward.unsqueeze(1) if reward.dim() == 1 else reward
+            done_t = done.unsqueeze(1) if done.dim() == 1 else done
+            q_backup = reward_t + self.gamma * (1 - done_t.float()) * v_target
 
         q1, q2 = self.critic(latent, action)
         critic_loss = F.mse_loss(q1, q_backup) + F.mse_loss(q2, q_backup)
